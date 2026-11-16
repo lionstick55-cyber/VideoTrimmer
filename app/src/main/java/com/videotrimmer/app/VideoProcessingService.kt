@@ -35,8 +35,9 @@ object ProcessingState {
     data class Job(
         val files: List<VideoFile>,
         val trimSec: Float,
+        val endTrimSec: Float,
+        val speed: Float,
         val title: String,
-        val crf: Int,
     )
 
     @Volatile
@@ -52,7 +53,13 @@ class VideoProcessingService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    private var work: kotlinx.coroutines.Job? = null
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            work?.cancel()
+            return START_NOT_STICKY
+        }
         val job = ProcessingState.pendingJob
         ProcessingState.pendingJob = null
 
@@ -73,20 +80,26 @@ class VideoProcessingService : Service() {
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VideoTrimmer:processing")
             .apply { acquire(6 * 60 * 60 * 1000L) }
 
-        scope.launch {
+        work = scope.launch {
+            var stopped = false
             val res = try {
                 processVideos(
                     context = this@VideoProcessingService,
                     files = job.files,
                     trimSec = job.trimSec,
+                    endTrimSec = job.endTrimSec,
+                    speed = job.speed,
                     title = job.title,
-                    crf = job.crf,
                     onProgress = { p, s ->
                         ProcessingState.progress = p
                         ProcessingState.statusText = s
                         updateProgressNotification(s, p)
                     },
+                    onResult = { r -> ProcessingState.results = ProcessingState.results + r },
                 )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                stopped = true
+                ProcessingState.results
             } catch (e: Exception) {
                 listOf(ProcessResult("전체", false, "처리 중 오류: ${e.message}"))
             }
@@ -96,7 +109,12 @@ class VideoProcessingService : Service() {
             ProcessingState.processing = false
 
             val ok = res.count { it.success }
-            showDoneNotification("✅ ${ok}/${res.size}개 처리 완료")
+            if (stopped) {
+                ProcessingState.statusText = "중지됨"
+                showDoneNotification("⏹ 중지됨 (완료된 ${ok}개는 저장됨)")
+            } else {
+                showDoneNotification("✅ ${ok}/${res.size}개 처리 완료")
+            }
             stopSelfSafely()
         }
         return START_NOT_STICKY
@@ -144,6 +162,14 @@ class VideoProcessingService : Service() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(openAppIntent())
+            .addAction(
+                android.R.drawable.ic_media_pause, "중지",
+                PendingIntent.getService(
+                    this, 1,
+                    Intent(this, VideoProcessingService::class.java).setAction(ACTION_STOP),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                )
+            )
             .build()
 
     private fun updateProgressNotification(text: String, progress: Float) {
@@ -178,6 +204,13 @@ class VideoProcessingService : Service() {
         private const val CHANNEL_ID = "video_processing"
         private const val NOTIF_PROGRESS_ID = 1
         private const val NOTIF_DONE_ID = 2
+        private const val ACTION_STOP = "com.videotrimmer.app.STOP"
+
+        fun stop(context: Context) {
+            context.startService(
+                Intent(context, VideoProcessingService::class.java).setAction(ACTION_STOP)
+            )
+        }
 
         fun start(context: Context, job: ProcessingState.Job) {
             ProcessingState.pendingJob = job

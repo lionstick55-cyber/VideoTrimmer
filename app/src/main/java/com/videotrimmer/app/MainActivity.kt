@@ -44,7 +44,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
+import androidx.media3.common.audio.AudioProcessor
+import androidx.media3.common.audio.SonicAudioProcessor
+import androidx.media3.effect.SpeedChangeEffect
+import androidx.media3.transformer.Effects
+import kotlinx.coroutines.CancellationException
 import androidx.media3.common.MimeTypes
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.DefaultEncoderFactory
@@ -120,6 +126,8 @@ fun VideoTrimmerScreen() {
     // State
     var files by remember { mutableStateOf(listOf<VideoFile>()) }
     var trimSeconds by remember { mutableStateOf("3") }
+    var endTrimSeconds by remember { mutableStateOf("0") }
+    var speed by remember { mutableStateOf(1.0f) }
     var titlePrefix by remember { mutableStateOf("제목") }
     // 처리 상태는 서비스와 공유 (앱을 나갔다 와도 유지)
     var processing by ProcessingState::processing
@@ -312,6 +320,44 @@ fun VideoTrimmerScreen() {
 
                     Spacer(Modifier.height(10.dp))
 
+                    // End trim seconds
+                    OutlinedTextField(
+                        value = endTrimSeconds,
+                        onValueChange = { endTrimSeconds = it.filter { c -> c.isDigit() || c == '.' } },
+                        label = { Text("뒷부분 자르기 (초)") },
+                        leadingIcon = { Icon(Icons.Default.ContentCut, null) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        colors = inputColors(),
+                    )
+
+                    Spacer(Modifier.height(14.dp))
+
+                    // Speed
+                    Text("⏩ 재생 속도", color = TextPrimary, fontSize = 14.sp)
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        listOf(1.0f, 1.2f, 1.5f).forEach { s ->
+                            val selected = speed == s
+                            FilledTonalButton(
+                                onClick = { speed = s },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.filledTonalButtonColors(
+                                    containerColor = if (selected) Accent else InputBg,
+                                    contentColor = Color.White,
+                                ),
+                            ) {
+                                Text(if (s == 1.0f) "원래 속도" else "${s}배속",
+                                     fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+
                     // Title prefix
                     OutlinedTextField(
                         value = titlePrefix,
@@ -363,6 +409,8 @@ fun VideoTrimmerScreen() {
                             ProcessingState.Job(
                                 files = files,
                                 trimSec = trimSeconds.toFloatOrNull() ?: 0f,
+                                endTrimSec = endTrimSeconds.toFloatOrNull() ?: 0f,
+                                speed = speed,
                                 title = titlePrefix.ifBlank { "제목" },
                             )
                         )
@@ -410,6 +458,16 @@ fun VideoTrimmerScreen() {
                         Text(statusText, color = TextDim, fontSize = 13.sp)
                         Text("${(progress * 100).toInt()}%",
                              color = Accent, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedButton(
+                            onClick = { VideoProcessingService.stop(context) },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Accent),
+                        ) {
+                            Icon(Icons.Default.Stop, null)
+                            Spacer(Modifier.width(6.dp))
+                            Text("중지", fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
             }
@@ -501,8 +559,11 @@ suspend fun processVideos(
     context: Context,
     files: List<VideoFile>,
     trimSec: Float,
+    endTrimSec: Float,
+    speed: Float,
     title: String,
     onProgress: (Float, String) -> Unit,
+    onResult: (ProcessResult) -> Unit = {},
 ): List<ProcessResult> = withContext(Dispatchers.IO) {
     val results = mutableListOf<ProcessResult>()
     val outputDir = File(context.cacheDir, "video_output").apply { mkdirs() }
@@ -518,8 +579,14 @@ suspend fun processVideos(
         val outputFile = File(outputDir, "out_$num.mp4")
         try {
             // 1. 폰 내장 HEVC 인코더로 앞부분 자르기 + 인코딩
-            val bitrate = sourceBitrate(context, vf.uri)
-            transcodeHevc(context, vf.uri, (trimSec * 1000).toLong(), bitrate, outputFile) { f ->
+            val info = sourceInfo(context, vf.uri)
+            val startMs = (trimSec * 1000).toLong().coerceAtLeast(0)
+            val endMs: Long? = if (endTrimSec > 0f && info.durationMs > 0)
+                info.durationMs - (endTrimSec * 1000).toLong() else null
+            if (endMs != null && endMs <= startMs) {
+                throw IllegalArgumentException("영상이 자를 길이보다 짧아요")
+            }
+            transcodeHevc(context, vf.uri, startMs, endMs, speed, info.bitrate, outputFile) { f ->
                 val pct = (f * 100).toInt()
                 onProgress((index + f) / files.size,
                     "처리 중: ${vf.name} ($num/${files.size}) · $pct%")
@@ -535,11 +602,15 @@ suspend fun processVideos(
             } else {
                 results.add(ProcessResult(outputName, false, "저장 실패"))
             }
+        } catch (e: CancellationException) {
+            outputFile.delete()
+            throw e
         } catch (e: Exception) {
             results.add(ProcessResult(outputName, false, "변환 오류: ${e.message}"))
         } finally {
             outputFile.delete()
         }
+        results.lastOrNull()?.let { onResult(it) }
     }
 
     outputDir.deleteRecursively()
@@ -551,15 +622,19 @@ suspend fun processVideos(
     results
 }
 
-/** 원본 영상의 비트레이트를 그대로 사용 → 원본 화질 유지 */
-fun sourceBitrate(context: Context, uri: Uri): Int {
+data class SourceInfo(val bitrate: Int, val durationMs: Long)
+
+/** 원본 영상의 비트레이트(→ 원본 화질 유지)와 길이를 읽는다 */
+fun sourceInfo(context: Context, uri: Uri): SourceInfo {
     var bitrate: Int? = null
+    var durationMs = 0L
     var width = 1920
     var height = 1080
     val r = MediaMetadataRetriever()
     try {
         r.setDataSource(context, uri)
         bitrate = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull()
+        durationMs = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
         r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()?.let { width = it }
         r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()?.let { height = it }
     } catch (e: Exception) {
@@ -570,12 +645,13 @@ fun sourceBitrate(context: Context, uri: Uri): Int {
     // 정보를 못 읽으면 해상도 기준으로 넉넉하게
     val fallback = width.toLong() * height * 30 / 5
     val b = bitrate?.toLong()?.takeIf { it > 0 } ?: fallback
-    return b.coerceIn(1_000_000L, 150_000_000L).toInt()
+    return SourceInfo(b.coerceIn(1_000_000L, 150_000_000L).toInt(), durationMs)
 }
 
 /** Media3 Transformer로 HEVC(H.265) 변환. 메인 스레드에서 실행해야 한다. */
 suspend fun transcodeHevc(
-    context: Context, uri: Uri, startMs: Long, bitrate: Int, output: File,
+    context: Context, uri: Uri, startMs: Long, endMs: Long?, speed: Float,
+    bitrate: Int, output: File,
     onFileProgress: (Float) -> Unit = {},
 ) = withContext(Dispatchers.Main) {
     suspendCancellableCoroutine<Unit> { cont ->
@@ -584,6 +660,7 @@ suspend fun transcodeHevc(
             .setClippingConfiguration(
                 MediaItem.ClippingConfiguration.Builder()
                     .setStartPositionMs(startMs.coerceAtLeast(0))
+                    .apply { if (endMs != null) setEndPositionMs(endMs) }
                     .build()
             )
             .build()
@@ -630,7 +707,17 @@ suspend fun transcodeHevc(
             handler.removeCallbacks(poll)
             transformer.cancel()
         }
-        transformer.start(EditedMediaItem.Builder(mediaItem).build(), output.absolutePath)
+        val edited = EditedMediaItem.Builder(mediaItem).apply {
+            if (speed != 1.0f) {
+                // 영상과 소리 모두 빠르게 (목소리 높낮이는 그대로)
+                val sonic = SonicAudioProcessor().apply {
+                    setSpeed(speed)
+                    setPitch(1.0f)
+                }
+                setEffects(Effects(listOf<AudioProcessor>(sonic), listOf<Effect>(SpeedChangeEffect(speed))))
+            }
+        }.build()
+        transformer.start(edited, output.absolutePath)
         handler.post(poll)
     }
 }
