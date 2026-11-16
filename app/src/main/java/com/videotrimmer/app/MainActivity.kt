@@ -22,6 +22,7 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.IntentSenderRequest
@@ -135,6 +136,7 @@ fun VideoTrimmerScreen() {
     var renameOnly by remember { mutableStateOf(false) }
     var pendingRename by remember { mutableStateOf<List<RenameItem>?>(null) }
     var trashedDone by remember { mutableStateOf(false) }
+    var showTrash by remember { mutableStateOf(false) }
     // 처리 상태는 서비스와 공유 (앱을 나갔다 와도 유지)
     var processing by ProcessingState::processing
     val progress by ProcessingState::progress
@@ -189,7 +191,7 @@ fun VideoTrimmerScreen() {
         if (res.resultCode == Activity.RESULT_OK) {
             trashedDone = true
             files = emptyList()
-            Toast.makeText(context, "원본을 휴지통으로 옮겼어요 (30일 안에 복구 가능)",
+            Toast.makeText(context, "원본을 휴지통으로 옮겼어요 (오른쪽 위 🗑에서 30일 안에 복원 가능)",
                 Toast.LENGTH_LONG).show()
         }
     }
@@ -273,8 +275,22 @@ fun VideoTrimmerScreen() {
         topBar = {
             CenterAlignedTopAppBar(
                 title = {
-                    Text("🎬 영상 일괄 편집기",
+                    Text(if (showTrash) "🗑 휴지통" else "🎬 영상 일괄 편집기",
                          fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                },
+                navigationIcon = {
+                    if (showTrash) {
+                        IconButton(onClick = { showTrash = false }) {
+                            Icon(Icons.Default.ArrowBack, "뒤로", tint = TextPrimary)
+                        }
+                    }
+                },
+                actions = {
+                    if (!showTrash) {
+                        IconButton(onClick = { showTrash = true }) {
+                            Icon(Icons.Default.Delete, "휴지통", tint = TextPrimary)
+                        }
+                    }
                 },
                 colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
                     containerColor = BgDark,
@@ -284,7 +300,10 @@ fun VideoTrimmerScreen() {
         },
         containerColor = BgDark,
     ) { padding ->
-        LazyColumn(
+        if (showTrash) {
+            BackHandler { showTrash = false }
+            TrashScreen(Modifier.padding(padding))
+        } else LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
