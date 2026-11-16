@@ -24,6 +24,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
@@ -101,6 +102,7 @@ data class ProcessResult(
     val fileName: String,
     val success: Boolean,
     val message: String,
+    val sourceUri: Uri? = null,   // 변환 성공 시 원본 (삭제용)
 )
 
 // ── Activity ────────────────────────────────────────────────
@@ -130,6 +132,9 @@ fun VideoTrimmerScreen() {
     var endTrimSeconds by remember { mutableStateOf("0") }
     var speed by remember { mutableStateOf(1.0f) }
     var titlePrefix by remember { mutableStateOf("제목") }
+    var renameOnly by remember { mutableStateOf(false) }
+    var pendingRename by remember { mutableStateOf<List<RenameItem>?>(null) }
+    var trashedDone by remember { mutableStateOf(false) }
     // 처리 상태는 서비스와 공유 (앱을 나갔다 와도 유지)
     var processing by ProcessingState::processing
     val progress by ProcessingState::progress
@@ -141,6 +146,75 @@ fun VideoTrimmerScreen() {
     val notifPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { }
+
+    // ── 제목만 바꾸기 ──
+    val renameLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { res ->
+        val plan = pendingRename
+        pendingRename = null
+        if (res.resultCode == Activity.RESULT_OK && plan != null) {
+            results = renameAll(context, plan)
+            showResults = true
+            files = emptyList()
+        } else {
+            Toast.makeText(context, "허용을 눌러야 이름을 바꿀 수 있어요", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun startRename() {
+        val t = titlePrefix.ifBlank { "제목" }
+        val plan = files.mapIndexed { i, vf ->
+            val ext = vf.name.substringAfterLast('.', "mp4")
+            RenameItem(vf, resolveMediaUri(context, vf.uri), "${t}_${i + 1}.$ext")
+        }
+        trashedDone = false
+        val media = plan.mapNotNull { it.mediaUri }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && media.isNotEmpty()) {
+            // 다른 앱(카메라)이 만든 영상은 안드로이드가 한 번 허락을 물어봄
+            pendingRename = plan
+            val pi = MediaStore.createWriteRequest(context.contentResolver, media)
+            renameLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
+        } else {
+            results = renameAll(context, plan)
+            showResults = true
+            files = emptyList()
+        }
+    }
+
+    // ── 성공한 원본 휴지통으로 ──
+    val trashLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { res ->
+        if (res.resultCode == Activity.RESULT_OK) {
+            trashedDone = true
+            files = emptyList()
+            Toast.makeText(context, "원본을 휴지통으로 옮겼어요 (30일 안에 복구 가능)",
+                Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun trashSucceededOriginals() {
+        val uris = results.filter { it.success }.mapNotNull { it.sourceUri }
+            .mapNotNull { resolveMediaUri(context, it) }.distinct()
+        if (uris.isEmpty()) {
+            Toast.makeText(context, "삭제할 수 있는 원본을 찾지 못했어요", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val pi = MediaStore.createTrashRequest(context.contentResolver, uris, true)
+            trashLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
+        } else {
+            // Android 10 이하는 휴지통이 없어 바로 삭제됨
+            var n = 0
+            uris.forEach { u ->
+                try { n += context.contentResolver.delete(u, null, null) } catch (e: Exception) { e.printStackTrace() }
+            }
+            trashedDone = true
+            files = emptyList()
+            Toast.makeText(context, "원본 ${n}개를 삭제했어요", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     // 선택한 영상 목록 반영 (파일 앱 / 갤러리 앱 공통)
     fun onVideosPicked(uris: List<Uri>) {
@@ -306,8 +380,30 @@ fun VideoTrimmerScreen() {
             item {
                 AppCard {
                     Text("⚙️ 설정", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Spacer(Modifier.height(10.dp))
+
+                    // Mode
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        listOf(false to "영상 변환", true to "제목만 바꾸기").forEach { (mode, label) ->
+                            val selected = renameOnly == mode
+                            FilledTonalButton(
+                                onClick = { renameOnly = mode },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.filledTonalButtonColors(
+                                    containerColor = if (selected) Accent else InputBg,
+                                    contentColor = Color.White,
+                                ),
+                            ) {
+                                Text(label, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+                            }
+                        }
+                    }
                     Spacer(Modifier.height(14.dp))
 
+                    if (!renameOnly) {
                     // Trim seconds
                     OutlinedTextField(
                         value = trimSeconds,
@@ -358,6 +454,7 @@ fun VideoTrimmerScreen() {
                     }
 
                     Spacer(Modifier.height(10.dp))
+                    }
 
                     // Title prefix
                     OutlinedTextField(
@@ -371,7 +468,11 @@ fun VideoTrimmerScreen() {
                     )
 
                     Spacer(Modifier.height(10.dp))
-                    Text("🎞 화질: 원본 그대로 유지", color = TextDim, fontSize = 12.sp)
+                    Text(
+                        if (renameOnly) "✏️ 영상은 그대로 두고 파일 이름만 바꿔요"
+                        else "🎞 화질: 원본 그대로 유지",
+                        color = TextDim, fontSize = 12.sp,
+                    )
 
                     // Preview
                     if (files.isNotEmpty()) {
@@ -383,7 +484,7 @@ fun VideoTrimmerScreen() {
                         Spacer(Modifier.height(6.dp))
                         val t = titlePrefix.ifBlank { "제목" }
                         files.take(4).forEachIndexed { i, vf ->
-                            val ext = "mp4"
+                            val ext = if (renameOnly) vf.name.substringAfterLast('.', "mp4") else "mp4"
                             Text("${vf.name}  →  ${t}_${i + 1}.$ext",
                                  color = Color(0xFF66ddaa), fontSize = 12.sp)
                         }
@@ -398,6 +499,10 @@ fun VideoTrimmerScreen() {
             item {
                 Button(
                     onClick = {
+                        if (renameOnly) {
+                            startRename()
+                        } else {
+                        trashedDone = false
                         if (Build.VERSION.SDK_INT >= 33 &&
                             ContextCompat.checkSelfPermission(
                                 context, Manifest.permission.POST_NOTIFICATIONS
@@ -418,6 +523,7 @@ fun VideoTrimmerScreen() {
                         Toast.makeText(context,
                             "변환을 시작했어요. 다른 앱을 써도 계속 진행돼요.",
                             Toast.LENGTH_SHORT).show()
+                        }
                     },
                     modifier = Modifier.fillMaxWidth().height(56.dp),
                     enabled = files.isNotEmpty() && !processing,
@@ -437,7 +543,8 @@ fun VideoTrimmerScreen() {
                     } else {
                         Icon(Icons.Default.RocketLaunch, null)
                         Spacer(Modifier.width(8.dp))
-                        Text("처리 시작", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        Text(if (renameOnly) "제목 바꾸기" else "처리 시작",
+                             fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }
@@ -518,6 +625,21 @@ fun VideoTrimmerScreen() {
                         Spacer(Modifier.height(10.dp))
                         Text("📂 저장 위치: 원본 영상과 같은 폴더",
                              color = Color(0xFF66ddaa), fontSize = 12.sp)
+
+                        val canTrash = !processing && !trashedDone &&
+                            results.any { it.success && it.sourceUri != null }
+                        if (canTrash) {
+                            Spacer(Modifier.height(10.dp))
+                            OutlinedButton(
+                                onClick = { trashSucceededOriginals() },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Accent),
+                            ) {
+                                Icon(Icons.Default.Delete, null)
+                                Spacer(Modifier.width(6.dp))
+                                Text("성공한 영상의 원본 삭제 (휴지통)")
+                            }
+                        }
 
                         if (fail > 0) {
                             Spacer(Modifier.height(10.dp))
@@ -650,7 +772,7 @@ suspend fun processVideos(
             if (savedDir != null) {
                 val note = if (sourceDir != null && savedDir != sourceDir)
                     " (원본 폴더에 저장할 수 없어 대체 폴더 사용)" else ""
-                results.add(ProcessResult(outputName, true, "저장: $savedDir$note"))
+                results.add(ProcessResult(outputName, true, "저장: $savedDir$note", vf.uri))
             } else {
                 results.add(ProcessResult(outputName, false, "저장 실패"))
             }
