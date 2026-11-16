@@ -63,6 +63,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -473,7 +474,7 @@ fun VideoTrimmerScreen() {
             }
 
             // ── Results ──
-            if (showResults && results.isNotEmpty()) {
+            if (results.isNotEmpty()) {
                 item {
                     val ok = results.count { it.success }
                     val fail = results.size - ok
@@ -573,7 +574,7 @@ suspend fun processVideos(
         val outputName = "${title}_${num}.mp4"
 
         withContext(Dispatchers.Main) {
-            onProgress(index.toFloat() / files.size, "처리 중: ${vf.name} ($num/${files.size})")
+            onProgress(index.toFloat() / files.size, "[$num/${files.size}] ${vf.name} · 준비 중")
         }
 
         val outputFile = File(outputDir, "out_$num.mp4")
@@ -589,7 +590,11 @@ suspend fun processVideos(
             transcodeHevc(context, vf.uri, startMs, endMs, speed, info.bitrate, outputFile) { f ->
                 val pct = (f * 100).toInt()
                 onProgress((index + f) / files.size,
-                    "처리 중: ${vf.name} ($num/${files.size}) · $pct%")
+                    "[$num/${files.size}] ${vf.name} · 변환 중 $pct%")
+            }
+
+            withContext(Dispatchers.Main) {
+                onProgress((index + 1f) / files.size, "[$num/${files.size}] ${vf.name} · 저장 중")
             }
 
             // 2. 원본과 같은 폴더에 저장 (안 되면 Movies/VideoTrimmer/)
@@ -610,7 +615,9 @@ suspend fun processVideos(
         } finally {
             outputFile.delete()
         }
-        results.lastOrNull()?.let { onResult(it) }
+        results.lastOrNull()?.let { r -> withContext(Dispatchers.Main) { onResult(r) } }
+        // 하드웨어 인코더가 완전히 풀릴 시간을 줌 (다음 파일에서 멈춤 방지)
+        delay(800)
     }
 
     outputDir.deleteRecursively()
@@ -647,6 +654,8 @@ fun sourceInfo(context: Context, uri: Uri): SourceInfo {
     val b = bitrate?.toLong()?.takeIf { it > 0 } ?: fallback
     return SourceInfo(b.coerceIn(1_000_000L, 150_000_000L).toInt(), durationMs)
 }
+
+private const val STALL_TIMEOUT_MS = 120_000L
 
 /** Media3 Transformer로 HEVC(H.265) 변환. 메인 스레드에서 실행해야 한다. */
 suspend fun transcodeHevc(
@@ -693,11 +702,27 @@ suspend fun transcodeHevc(
         // 파일 하나 안에서의 진행률을 0.5초마다 확인
         val handler = Handler(Looper.getMainLooper())
         val holder = ProgressHolder()
+        var lastProgress = -1
+        var lastChange = System.currentTimeMillis()
         val poll = object : Runnable {
             override fun run() {
                 if (!cont.isActive) return
                 if (transformer.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) {
                     onFileProgress(holder.progress / 100f)
+                    if (holder.progress != lastProgress) {
+                        lastProgress = holder.progress
+                        lastChange = System.currentTimeMillis()
+                    }
+                }
+                // 2분 동안 진행이 전혀 없으면 멈춘 것으로 보고 이 파일은 건너뜀
+                if (System.currentTimeMillis() - lastChange > STALL_TIMEOUT_MS) {
+                    transformer.cancel()
+                    if (cont.isActive) cont.resumeWithException(
+                        IllegalStateException(
+                            "2분 동안 진행이 없어 건너뜀 (진행률 ${maxOf(lastProgress, 0)}%에서 멈춤)"
+                        )
+                    )
+                    return
                 }
                 handler.postDelayed(this, 500)
             }
