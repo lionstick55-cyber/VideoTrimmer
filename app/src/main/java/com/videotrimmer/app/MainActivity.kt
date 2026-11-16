@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.widget.Toast
@@ -460,7 +461,7 @@ fun VideoTrimmerScreen() {
                         }
 
                         Spacer(Modifier.height(10.dp))
-                        Text("📂 저장 위치: Movies/VideoTrimmer/",
+                        Text("📂 저장 위치: 원본 영상과 같은 폴더",
                              color = Color(0xFF66ddaa), fontSize = 12.sp)
                     }
                 }
@@ -549,10 +550,13 @@ suspend fun processVideos(
             val session = FFmpegKit.execute(cmd)
 
             if (ReturnCode.isSuccess(session.returnCode)) {
-                // 3. MediaStore에 저장 (Movies/VideoTrimmer/)
-                val saved = saveToMediaStore(context, outputFile, outputName, ext)
-                if (saved) {
-                    results.add(ProcessResult(outputName, true, "성공"))
+                // 3. 원본과 같은 폴더에 저장 (안 되면 Movies/VideoTrimmer/)
+                val sourceDir = getSourceRelativePath(context, vf.uri)
+                val savedDir = saveToMediaStore(context, outputFile, outputName, ext, sourceDir)
+                if (savedDir != null) {
+                    val note = if (sourceDir != null && savedDir != sourceDir)
+                        " (원본 폴더에 저장할 수 없어 대체 폴더 사용)" else ""
+                    results.add(ProcessResult(outputName, true, "저장: $savedDir$note"))
                 } else {
                     results.add(ProcessResult(outputName, false, "MediaStore 저장 실패"))
                 }
@@ -582,46 +586,111 @@ suspend fun processVideos(
 
 // ── MediaStore 저장 ─────────────────────────────────────────
 
-fun saveToMediaStore(context: Context, file: File, name: String, ext: String): Boolean {
-    return try {
-        val mimeType = when (ext.lowercase()) {
-            "mp4", "m4v" -> "video/mp4"
-            "mkv" -> "video/x-matroska"
-            "avi" -> "video/x-msvideo"
-            "mov" -> "video/quicktime"
-            "webm" -> "video/webm"
-            "ts" -> "video/mp2t"
-            else -> "video/mp4"
+private const val FALLBACK_DIR = "Movies/VideoTrimmer/"
+
+/** 원본 영상이 들어 있는 폴더(예: "DCIM/Camera/")를 알아낸다. 모르면 null. */
+fun getSourceRelativePath(context: Context, uri: Uri): String? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+    try {
+        // 파일 앱(내장 저장소)으로 고른 경우: "primary:DCIM/Camera/a.mp4"
+        if (DocumentsContract.isDocumentUri(context, uri) &&
+            uri.authority == "com.android.externalstorage.documents") {
+            val docId = DocumentsContract.getDocumentId(uri)
+            if (!docId.startsWith("primary:")) return null
+            val path = docId.removePrefix("primary:")
+            return if (path.contains('/')) path.substringBeforeLast('/') + "/" else null
         }
 
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, name)
-            put(MediaStore.Video.Media.MIME_TYPE, mimeType)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Video.Media.RELATIVE_PATH,
-                    "${Environment.DIRECTORY_MOVIES}/VideoTrimmer")
-                put(MediaStore.Video.Media.IS_PENDING, 1)
+        // MediaStore 영상 URI 찾기 (갤러리, 파일 앱의 '동영상' 항목, Google 포토)
+        val mediaUri: Uri? = when {
+            uri.authority == MediaStore.AUTHORITY -> uri
+            DocumentsContract.isDocumentUri(context, uri) &&
+                uri.authority == "com.android.providers.media.documents" ->
+                MediaStore.getMediaUri(context, uri)
+            else -> Regex("content://media/[^/]+/(video|file|images)/media/\\d+")
+                .find(Uri.decode(uri.toString()))?.value?.let { Uri.parse(it) }
+        }
+
+        val target = mediaUri ?: uri
+        context.contentResolver.query(
+            target, arrayOf(MediaStore.MediaColumns.RELATIVE_PATH), null, null, null
+        )?.use { c ->
+            if (c.moveToFirst()) {
+                val idx = c.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+                if (idx >= 0) return c.getString(idx)?.takeIf { it.isNotBlank() }
             }
         }
-
-        val uri = context.contentResolver.insert(
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
-        ) ?: return false
-
-        context.contentResolver.openOutputStream(uri)?.use { out ->
-            file.inputStream().use { inp -> inp.copyTo(out) }
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            values.clear()
-            values.put(MediaStore.Video.Media.IS_PENDING, 0)
-            context.contentResolver.update(uri, values, null, null)
-        }
-
-        true
     } catch (e: Exception) {
         e.printStackTrace()
-        false
+    }
+    return null
+}
+
+private fun insertAndCopy(
+    context: Context, file: File, name: String, mimeType: String, relPath: String?,
+): Boolean {
+    val resolver = context.contentResolver
+    val isDownload = relPath?.startsWith(Environment.DIRECTORY_DOWNLOADS) == true
+    val collection =
+        if (isDownload && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        else MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+        put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            if (relPath != null) put(MediaStore.MediaColumns.RELATIVE_PATH, relPath)
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+    }
+
+    val uri = resolver.insert(collection, values) ?: return false
+    return try {
+        resolver.openOutputStream(uri)?.use { out ->
+            file.inputStream().use { inp -> inp.copyTo(out) }
+        } ?: throw IllegalStateException("출력 스트림 없음")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            values.clear()
+            values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+        }
+        true
+    } catch (e: Exception) {
+        resolver.delete(uri, null, null)
+        throw e
+    }
+}
+
+/**
+ * 원본과 같은 폴더에 저장한다. 그 폴더에 쓸 수 없으면 Movies/VideoTrimmer/ 에 저장.
+ * 저장된 폴더 경로를 돌려주고, 실패하면 null.
+ */
+fun saveToMediaStore(
+    context: Context, file: File, name: String, ext: String, sourceDir: String?,
+): String? {
+    val mimeType = when (ext.lowercase()) {
+        "mp4", "m4v" -> "video/mp4"
+        "mkv" -> "video/x-matroska"
+        "avi" -> "video/x-msvideo"
+        "mov" -> "video/quicktime"
+        "webm" -> "video/webm"
+        "ts" -> "video/mp2t"
+        else -> "video/mp4"
+    }
+
+    if (sourceDir != null) {
+        try {
+            if (insertAndCopy(context, file, name, mimeType, sourceDir)) return sourceDir
+        } catch (e: Exception) {
+            e.printStackTrace() // 안드로이드가 이 폴더에 영상 저장을 허용하지 않는 경우
+        }
+    }
+    return try {
+        if (insertAndCopy(context, file, name, mimeType, FALLBACK_DIR)) FALLBACK_DIR else null
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
     }
 }
 
