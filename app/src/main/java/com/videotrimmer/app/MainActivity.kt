@@ -518,11 +518,38 @@ fun VideoTrimmerScreen() {
                         Spacer(Modifier.height(10.dp))
                         Text("📂 저장 위치: 원본 영상과 같은 폴더",
                              color = Color(0xFF66ddaa), fontSize = 12.sp)
+
+                        if (fail > 0) {
+                            Spacer(Modifier.height(10.dp))
+                            OutlinedButton(
+                                onClick = { copyDebugLog(context) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("📋 오류 로그 복사 (개발자에게 보내기)")
+                            }
+                        }
                     }
                 }
             }
         }
     }
+}
+
+/** 이 앱의 내부 로그를 클립보드에 복사 (문제 원인 파악용) */
+fun copyDebugLog(context: Context) {
+    val log = try {
+        val pid = android.os.Process.myPid()
+        val proc = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-t", "600", "--pid=$pid"))
+        proc.inputStream.bufferedReader().readText()
+    } catch (e: Exception) {
+        "로그를 읽을 수 없음: ${e.message}"
+    }
+    val header = "기기: ${Build.MANUFACTURER} ${Build.MODEL} / Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})\n\n"
+    // 너무 길면 뒷부분만
+    val text = (header + log).let { if (it.length > 60_000) header + it.takeLast(60_000) else it }
+    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+    cm.setPrimaryClip(android.content.ClipData.newPlainText("VideoTrimmer log", text))
+    Toast.makeText(context, "로그를 복사했어요. 채팅창에 붙여넣기 해 주세요.", Toast.LENGTH_LONG).show()
 }
 
 // ── Components ──────────────────────────────────────────────
@@ -718,6 +745,7 @@ suspend fun transcodeHevc(
                     exportResult: ExportResult,
                     exportException: ExportException,
                 ) {
+                    android.util.Log.e("VT", "export error", exportException)
                     if (cont.isActive) cont.resumeWithException(exportException)
                 }
             })
@@ -753,6 +781,7 @@ suspend fun transcodeHevc(
                 val stalled = if (lastProgress <= 0) now - startedAt > START_TIMEOUT_MS
                               else now - lastChange > STALL_TIMEOUT_MS
                 if (stalled) {
+                    android.util.Log.w("VT", "stalled state=$state progress=$lastProgress")
                     handler.removeCallbacks(this)
                     transformer.cancel()
                     if (cont.isActive) cont.resumeWithException(
@@ -778,6 +807,7 @@ suspend fun transcodeHevc(
                 setEffects(Effects(listOf<AudioProcessor>(sonic), listOf<Effect>(SpeedChangeEffect(speed))))
             }
         }.build()
+        android.util.Log.i("VT", "start uri=$uri startMs=$startMs endMs=$endMs speed=$speed bitrate=$bitrate")
         transformer.start(edited, output.absolutePath)
         handler.post(poll)
     }
