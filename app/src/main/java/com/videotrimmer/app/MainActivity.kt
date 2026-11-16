@@ -42,7 +42,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -133,6 +135,8 @@ fun VideoTrimmerScreen() {
     var endTrimSeconds by remember { mutableStateOf("0") }
     var speed by remember { mutableStateOf(1.0f) }
     var titlePrefix by remember { mutableStateOf("제목") }
+    var startNumberText by remember { mutableStateOf("1") }
+    val startNumber = startNumberText.toIntOrNull()?.coerceAtLeast(0) ?: 1
     var renameOnly by remember { mutableStateOf(false) }
     var pendingRename by remember { mutableStateOf<List<RenameItem>?>(null) }
     var trashedDone by remember { mutableStateOf(false) }
@@ -168,7 +172,7 @@ fun VideoTrimmerScreen() {
         val t = titlePrefix.ifBlank { "제목" }
         val plan = files.mapIndexed { i, vf ->
             val ext = vf.name.substringAfterLast('.', "mp4")
-            RenameItem(vf, resolveMediaUri(context, vf.uri), "${t}_${i + 1}.$ext")
+            RenameItem(vf, resolveMediaUri(context, vf.uri), "${t}_${i + startNumber}.$ext")
         }
         trashedDone = false
         val media = plan.mapNotNull { it.mediaUri }
@@ -452,39 +456,60 @@ fun VideoTrimmerScreen() {
                     // Speed
                     Text("⏩ 재생 속도", color = TextPrimary, fontSize = 14.sp)
                     Spacer(Modifier.height(6.dp))
+                    listOf(1.0f, 1.2f, 1.5f, 2f, 3f, 4f, 5f).chunked(4).forEach { rowSpeeds ->
                     Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        listOf(1.0f, 1.2f, 1.5f).forEach { s ->
+                        rowSpeeds.forEach { s ->
                             val selected = speed == s
                             FilledTonalButton(
                                 onClick = { speed = s },
                                 modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 4.dp),
                                 colors = ButtonDefaults.filledTonalButtonColors(
                                     containerColor = if (selected) Accent else InputBg,
                                     contentColor = Color.White,
                                 ),
                             ) {
-                                Text(if (s == 1.0f) "원래 속도" else "${s}배속",
+                                val label = when {
+                                    s == 1.0f -> "원래"
+                                    s % 1f == 0f -> "${s.toInt()}배"
+                                    else -> "${s}배"
+                                }
+                                Text(label, fontSize = 13.sp,
                                      fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
                             }
                         }
+                        // 줄 맞춤용 빈칸
+                        repeat(4 - rowSpeeds.size) { Spacer(Modifier.weight(1f)) }
+                    }
                     }
 
                     Spacer(Modifier.height(10.dp))
                     }
 
-                    // Title prefix
-                    OutlinedTextField(
-                        value = titlePrefix,
-                        onValueChange = { titlePrefix = it },
-                        label = { Text("출력 파일 제목") },
-                        leadingIcon = { Icon(Icons.Default.Title, null) },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        colors = inputColors(),
-                    )
+                    // Title prefix + start number
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = titlePrefix,
+                            onValueChange = { titlePrefix = it },
+                            label = { Text("파일 제목") },
+                            leadingIcon = { Icon(Icons.Default.Title, null) },
+                            modifier = Modifier.weight(2f),
+                            singleLine = true,
+                            colors = inputColors(),
+                        )
+                        OutlinedTextField(
+                            value = startNumberText,
+                            onValueChange = { startNumberText = it.filter { c -> c.isDigit() }.take(5) },
+                            label = { Text("시작 번호") },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            colors = inputColors(),
+                        )
+                    }
 
                     Spacer(Modifier.height(10.dp))
                     Text(
@@ -504,7 +529,7 @@ fun VideoTrimmerScreen() {
                         val t = titlePrefix.ifBlank { "제목" }
                         files.take(4).forEachIndexed { i, vf ->
                             val ext = if (renameOnly) vf.name.substringAfterLast('.', "mp4") else "mp4"
-                            Text("${vf.name}  →  ${t}_${i + 1}.$ext",
+                            Text("${vf.name}  →  ${t}_${i + startNumber}.$ext",
                                  color = Color(0xFF66ddaa), fontSize = 12.sp)
                         }
                         if (files.size > 4) {
@@ -537,6 +562,7 @@ fun VideoTrimmerScreen() {
                                 endTrimSec = endTrimSeconds.toFloatOrNull() ?: 0f,
                                 speed = speed,
                                 title = titlePrefix.ifBlank { "제목" },
+                                startNumber = startNumber,
                             )
                         )
                         Toast.makeText(context,
@@ -731,6 +757,7 @@ suspend fun processVideos(
     endTrimSec: Float,
     speed: Float,
     title: String,
+    startNumber: Int = 1,
     onProgress: (Float, String) -> Unit,
     onResult: (ProcessResult) -> Unit = {},
 ): List<ProcessResult> = withContext(Dispatchers.IO) {
@@ -739,7 +766,7 @@ suspend fun processVideos(
 
     files.forEachIndexed { index, vf ->
         val num = index + 1
-        val outputName = "${title}_${num}.mp4"
+        val outputName = "${title}_${index + startNumber}.mp4"
 
         withContext(Dispatchers.Main) {
             onProgress(index.toFloat() / files.size, "[$num/${files.size}] ${vf.name} · 준비 중")

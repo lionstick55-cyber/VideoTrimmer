@@ -38,6 +38,7 @@ object ProcessingState {
         val endTrimSec: Float,
         val speed: Float,
         val title: String,
+        val startNumber: Int = 1,
     )
 
     @Volatile
@@ -90,6 +91,7 @@ class VideoProcessingService : Service() {
                     endTrimSec = job.endTrimSec,
                     speed = job.speed,
                     title = job.title,
+                    startNumber = job.startNumber,
                     onProgress = { p, s ->
                         ProcessingState.progress = p
                         ProcessingState.statusText = s
