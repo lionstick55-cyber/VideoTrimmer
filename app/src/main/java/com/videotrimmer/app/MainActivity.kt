@@ -1,7 +1,9 @@
 package com.videotrimmer.app
 
+import android.app.Activity
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -106,10 +108,8 @@ fun VideoTrimmerScreen() {
     var results by remember { mutableStateOf(listOf<ProcessResult>()) }
     var showResults by remember { mutableStateOf(false) }
 
-    // File picker
-    val filePicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenMultipleDocuments()
-    ) { uris ->
+    // 선택한 영상 목록 반영 (파일 앱 / 갤러리 앱 공통)
+    fun onVideosPicked(uris: List<Uri>) {
         if (uris.isNotEmpty()) {
             files = uris.map { uri ->
                 val (name, size) = getFileInfo(context, uri)
@@ -117,6 +117,47 @@ fun VideoTrimmerScreen() {
             }
             showResults = false
             results = emptyList()
+        }
+    }
+
+    // 파일 앱으로 선택
+    val filePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> onVideosPicked(uris) }
+
+    // 갤러리 앱(삼성 갤러리, Google 포토 등)으로 선택
+    val galleryPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        if (result.resultCode == Activity.RESULT_OK && data != null) {
+            val uris = mutableListOf<Uri>()
+            val clip = data.clipData
+            if (clip != null) {
+                for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri)
+            } else {
+                data.data?.let { uris.add(it) }
+            }
+            onVideosPicked(uris)
+        }
+    }
+
+    fun launchGallery() {
+        val pick = Intent(Intent.ACTION_PICK).apply {
+            setDataAndType(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "video/*")
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        }
+        val chooser = Intent.createChooser(pick, "갤러리 앱 선택")
+        try {
+            galleryPicker.launch(chooser)
+        } catch (e: Exception) {
+            // 갤러리 앱이 없으면 일반 미디어 선택으로 대체
+            val fallback = Intent(Intent.ACTION_GET_CONTENT).apply {
+                type = "video/*"
+                addCategory(Intent.CATEGORY_OPENABLE)
+                putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            }
+            galleryPicker.launch(Intent.createChooser(fallback, "영상 선택"))
         }
     }
 
@@ -161,16 +202,35 @@ fun VideoTrimmerScreen() {
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text("📁 영상 파일", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
                         FilledTonalButton(
-                            onClick = { filePicker.launch(arrayOf("video/*")) },
+                            onClick = { launchGallery() },
+                            modifier = Modifier.weight(1f),
                             colors = ButtonDefaults.filledTonalButtonColors(
                                 containerColor = Color(0xFF0f3460),
                                 contentColor = Color.White,
                             )
                         ) {
-                            Icon(Icons.Default.VideoLibrary, null, Modifier.size(18.dp))
+                            Icon(Icons.Default.PhotoLibrary, null, Modifier.size(18.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text("파일 선택")
+                            Text("갤러리")
+                        }
+                        FilledTonalButton(
+                            onClick = { filePicker.launch(arrayOf("video/*")) },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = Color(0xFF0f3460),
+                                contentColor = Color.White,
+                            )
+                        ) {
+                            Icon(Icons.Default.Folder, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("파일")
                         }
                     }
 
