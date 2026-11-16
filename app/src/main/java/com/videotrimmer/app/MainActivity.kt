@@ -3,7 +3,13 @@
 package com.videotrimmer.app
 
 import android.app.Activity
+import android.Manifest
 import android.content.ContentValues
+import android.content.pm.PackageManager
+import android.os.Handler
+import android.os.Looper
+import androidx.core.content.ContextCompat
+import androidx.media3.transformer.ProgressHolder
 import android.media.MediaMetadataRetriever
 import android.content.Context
 import android.content.Intent
@@ -115,12 +121,17 @@ fun VideoTrimmerScreen() {
     var files by remember { mutableStateOf(listOf<VideoFile>()) }
     var trimSeconds by remember { mutableStateOf("3") }
     var titlePrefix by remember { mutableStateOf("제목") }
-    var crfValue by remember { mutableStateOf(20f) }
-    var processing by remember { mutableStateOf(false) }
-    var progress by remember { mutableStateOf(0f) }
-    var statusText by remember { mutableStateOf("") }
-    var results by remember { mutableStateOf(listOf<ProcessResult>()) }
-    var showResults by remember { mutableStateOf(false) }
+    // 처리 상태는 서비스와 공유 (앱을 나갔다 와도 유지)
+    var processing by ProcessingState::processing
+    val progress by ProcessingState::progress
+    val statusText by ProcessingState::statusText
+    var results by ProcessingState::results
+    var showResults by ProcessingState::showResults
+
+    // 알림 권한 (진행률을 알림창에 표시)
+    val notifPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
 
     // 선택한 영상 목록 반영 (파일 앱 / 갤러리 앱 공통)
     fun onVideosPicked(uris: List<Uri>) {
@@ -312,28 +323,8 @@ fun VideoTrimmerScreen() {
                         colors = inputColors(),
                     )
 
-                    Spacer(Modifier.height(16.dp))
-
-                    // CRF slider
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("화질 CRF", color = TextPrimary, fontSize = 14.sp)
-                        Spacer(Modifier.weight(1f))
-                        Text("${crfValue.toInt()}",
-                             color = Accent, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    }
-                    Slider(
-                        value = crfValue,
-                        onValueChange = { crfValue = it },
-                        valueRange = 10f..40f,
-                        steps = 29,
-                        colors = SliderDefaults.colors(
-                            thumbColor = Accent,
-                            activeTrackColor = Accent,
-                            inactiveTrackColor = InputBg,
-                        )
-                    )
-                    Text("💡 낮을수록 고화질·큰 파일  ·  18~23 = 고화질 권장  ·  28 = 보통",
-                         color = TextDim, fontSize = 11.sp)
+                    Spacer(Modifier.height(10.dp))
+                    Text("🎞 화질: 원본 그대로 유지", color = TextDim, fontSize = 12.sp)
 
                     // Preview
                     if (files.isNotEmpty()) {
@@ -360,32 +351,24 @@ fun VideoTrimmerScreen() {
             item {
                 Button(
                     onClick = {
-                        scope.launch {
-                            processing = true
-                            progress = 0f
-                            showResults = false
-                            results = emptyList()
-
-                            val res = processVideos(
-                                context = context,
+                        if (Build.VERSION.SDK_INT >= 33 &&
+                            ContextCompat.checkSelfPermission(
+                                context, Manifest.permission.POST_NOTIFICATIONS
+                            ) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                        VideoProcessingService.start(
+                            context,
+                            ProcessingState.Job(
                                 files = files,
                                 trimSec = trimSeconds.toFloatOrNull() ?: 0f,
                                 title = titlePrefix.ifBlank { "제목" },
-                                crf = crfValue.toInt(),
-                                onProgress = { p, s ->
-                                    progress = p
-                                    statusText = s
-                                }
                             )
-
-                            results = res
-                            showResults = true
-                            processing = false
-
-                            val ok = res.count { it.success }
-                            Toast.makeText(context,
-                                "✅ ${ok}/${res.size} 파일 처리 완료!", Toast.LENGTH_LONG).show()
-                        }
+                        )
+                        Toast.makeText(context,
+                            "변환을 시작했어요. 다른 앱을 써도 계속 진행돼요.",
+                            Toast.LENGTH_SHORT).show()
                     },
                     modifier = Modifier.fillMaxWidth().height(56.dp),
                     enabled = files.isNotEmpty() && !processing,
@@ -519,7 +502,6 @@ suspend fun processVideos(
     files: List<VideoFile>,
     trimSec: Float,
     title: String,
-    crf: Int,
     onProgress: (Float, String) -> Unit,
 ): List<ProcessResult> = withContext(Dispatchers.IO) {
     val results = mutableListOf<ProcessResult>()
@@ -536,8 +518,12 @@ suspend fun processVideos(
         val outputFile = File(outputDir, "out_$num.mp4")
         try {
             // 1. 폰 내장 HEVC 인코더로 앞부분 자르기 + 인코딩
-            val bitrate = estimateBitrate(context, vf.uri, crf)
-            transcodeHevc(context, vf.uri, (trimSec * 1000).toLong(), bitrate, outputFile)
+            val bitrate = sourceBitrate(context, vf.uri)
+            transcodeHevc(context, vf.uri, (trimSec * 1000).toLong(), bitrate, outputFile) { f ->
+                val pct = (f * 100).toInt()
+                onProgress((index + f) / files.size,
+                    "처리 중: ${vf.name} ($num/${files.size}) · $pct%")
+            }
 
             // 2. 원본과 같은 폴더에 저장 (안 되면 Movies/VideoTrimmer/)
             val sourceDir = getSourceRelativePath(context, vf.uri)
@@ -565,39 +551,32 @@ suspend fun processVideos(
     results
 }
 
-/**
- * CRF 값을 하드웨어 인코더용 비트레이트로 환산한다.
- * CRF 18 ≈ 픽셀당 0.12비트, CRF가 6 오를 때마다 절반.
- */
-fun estimateBitrate(context: Context, uri: Uri, crf: Int): Int {
+/** 원본 영상의 비트레이트를 그대로 사용 → 원본 화질 유지 */
+fun sourceBitrate(context: Context, uri: Uri): Int {
+    var bitrate: Int? = null
     var width = 1920
     var height = 1080
-    var fps = 30f
     val r = MediaMetadataRetriever()
     try {
         r.setDataSource(context, uri)
+        bitrate = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull()
         r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()?.let { width = it }
         r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()?.let { height = it }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            val frames = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)?.toFloatOrNull()
-            val durMs = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toFloatOrNull()
-            if (frames != null && durMs != null && durMs > 0) {
-                fps = (frames / (durMs / 1000f)).coerceIn(10f, 120f)
-            }
-        }
     } catch (e: Exception) {
         e.printStackTrace()
     } finally {
         try { r.release() } catch (_: Exception) {}
     }
-    val bpp = 0.12 * Math.pow(2.0, -(crf - 18) / 6.0)
-    val bitrate = width.toDouble() * height * fps * bpp
-    return bitrate.coerceIn(500_000.0, 100_000_000.0).toInt()
+    // 정보를 못 읽으면 해상도 기준으로 넉넉하게
+    val fallback = width.toLong() * height * 30 / 5
+    val b = bitrate?.toLong()?.takeIf { it > 0 } ?: fallback
+    return b.coerceIn(1_000_000L, 150_000_000L).toInt()
 }
 
 /** Media3 Transformer로 HEVC(H.265) 변환. 메인 스레드에서 실행해야 한다. */
 suspend fun transcodeHevc(
     context: Context, uri: Uri, startMs: Long, bitrate: Int, output: File,
+    onFileProgress: (Float) -> Unit = {},
 ) = withContext(Dispatchers.Main) {
     suspendCancellableCoroutine<Unit> { cont ->
         val mediaItem = MediaItem.Builder()
@@ -634,8 +613,25 @@ suspend fun transcodeHevc(
             })
             .build()
 
-        cont.invokeOnCancellation { transformer.cancel() }
+        // 파일 하나 안에서의 진행률을 0.5초마다 확인
+        val handler = Handler(Looper.getMainLooper())
+        val holder = ProgressHolder()
+        val poll = object : Runnable {
+            override fun run() {
+                if (!cont.isActive) return
+                if (transformer.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) {
+                    onFileProgress(holder.progress / 100f)
+                }
+                handler.postDelayed(this, 500)
+            }
+        }
+
+        cont.invokeOnCancellation {
+            handler.removeCallbacks(poll)
+            transformer.cancel()
+        }
         transformer.start(EditedMediaItem.Builder(mediaItem).build(), output.absolutePath)
+        handler.post(poll)
     }
 }
 
