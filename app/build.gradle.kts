@@ -54,6 +54,9 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.7.0")
 
-    // FFmpegKit (원본은 2025년 배포 중단 → 커뮤니티 재배포판 사용)
-    implementation("com.moizhassan.ffmpeg:ffmpeg-kit-16kb:6.0.0")
+    // Media3 Transformer - 폰 내장 하드웨어 HEVC 인코더 사용 (Google 공식)
+    implementation("androidx.media3:media3-transformer:1.4.1")
+    implementation("androidx.media3:media3-effect:1.4.1")
+    implementation("androidx.media3:media3-common:1.4.1")
+    implementation("androidx.annotation:annotation-experimental:1.4.1")
 }

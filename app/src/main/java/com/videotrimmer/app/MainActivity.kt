@@ -1,7 +1,10 @@
+@file:androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+
 package com.videotrimmer.app
 
 import android.app.Activity
 import android.content.ContentValues
+import android.media.MediaMetadataRetriever
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -35,8 +38,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.arthenica.ffmpegkit.FFmpegKit
-import com.arthenica.ffmpegkit.ReturnCode
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -311,15 +324,15 @@ fun VideoTrimmerScreen() {
                     Slider(
                         value = crfValue,
                         onValueChange = { crfValue = it },
-                        valueRange = 0f..51f,
-                        steps = 50,
+                        valueRange = 10f..40f,
+                        steps = 29,
                         colors = SliderDefaults.colors(
                             thumbColor = Accent,
                             activeTrackColor = Accent,
                             inactiveTrackColor = InputBg,
                         )
                     )
-                    Text("💡 0 = 무손실  ·  18~23 = 고화질 권장  ·  28 = 보통",
+                    Text("💡 낮을수록 고화질·큰 파일  ·  18~23 = 고화질 권장  ·  28 = 보통",
                          color = TextDim, fontSize = 11.sp)
 
                     // Preview
@@ -332,7 +345,7 @@ fun VideoTrimmerScreen() {
                         Spacer(Modifier.height(6.dp))
                         val t = titlePrefix.ifBlank { "제목" }
                         files.take(4).forEachIndexed { i, vf ->
-                            val ext = vf.name.substringAfterLast('.', "mp4")
+                            val ext = "mp4"
                             Text("${vf.name}  →  ${t}_${i + 1}.$ext",
                                  color = Color(0xFF66ddaa), fontSize = 12.sp)
                         }
@@ -510,71 +523,39 @@ suspend fun processVideos(
     onProgress: (Float, String) -> Unit,
 ): List<ProcessResult> = withContext(Dispatchers.IO) {
     val results = mutableListOf<ProcessResult>()
-    val cacheDir = File(context.cacheDir, "video_input").apply { mkdirs() }
     val outputDir = File(context.cacheDir, "video_output").apply { mkdirs() }
 
     files.forEachIndexed { index, vf ->
         val num = index + 1
-        val ext = vf.name.substringAfterLast('.', "mp4")
-        val outputName = "${title}_${num}.$ext"
+        val outputName = "${title}_${num}.mp4"
 
         withContext(Dispatchers.Main) {
             onProgress(index.toFloat() / files.size, "처리 중: ${vf.name} ($num/${files.size})")
         }
 
-        // 1. Content URI → temp file
-        val inputFile = File(cacheDir, "input_$num.$ext")
+        val outputFile = File(outputDir, "out_$num.mp4")
         try {
-            context.contentResolver.openInputStream(vf.uri)?.use { input ->
-                FileOutputStream(inputFile).use { output ->
-                    input.copyTo(output)
-                }
-            } ?: run {
-                results.add(ProcessResult(outputName, false, "파일을 읽을 수 없습니다"))
-                return@forEachIndexed
-            }
-        } catch (e: Exception) {
-            results.add(ProcessResult(outputName, false, "파일 복사 실패: ${e.message}"))
-            return@forEachIndexed
-        }
+            // 1. 폰 내장 HEVC 인코더로 앞부분 자르기 + 인코딩
+            val bitrate = estimateBitrate(context, vf.uri, crf)
+            transcodeHevc(context, vf.uri, (trimSec * 1000).toLong(), bitrate, outputFile)
 
-        // 2. FFmpeg 처리
-        val outputFile = File(outputDir, outputName)
-        val cmd = "-y -i \"${inputFile.absolutePath}\" " +
-                  "-ss $trimSec " +
-                  "-c:v libx265 -crf $crf -tag:v hvc1 " +
-                  "-c:a copy " +
-                  "\"${outputFile.absolutePath}\""
-
-        try {
-            val session = FFmpegKit.execute(cmd)
-
-            if (ReturnCode.isSuccess(session.returnCode)) {
-                // 3. 원본과 같은 폴더에 저장 (안 되면 Movies/VideoTrimmer/)
-                val sourceDir = getSourceRelativePath(context, vf.uri)
-                val savedDir = saveToMediaStore(context, outputFile, outputName, ext, sourceDir)
-                if (savedDir != null) {
-                    val note = if (sourceDir != null && savedDir != sourceDir)
-                        " (원본 폴더에 저장할 수 없어 대체 폴더 사용)" else ""
-                    results.add(ProcessResult(outputName, true, "저장: $savedDir$note"))
-                } else {
-                    results.add(ProcessResult(outputName, false, "MediaStore 저장 실패"))
-                }
+            // 2. 원본과 같은 폴더에 저장 (안 되면 Movies/VideoTrimmer/)
+            val sourceDir = getSourceRelativePath(context, vf.uri)
+            val savedDir = saveToMediaStore(context, outputFile, outputName, "mp4", sourceDir)
+            if (savedDir != null) {
+                val note = if (sourceDir != null && savedDir != sourceDir)
+                    " (원본 폴더에 저장할 수 없어 대체 폴더 사용)" else ""
+                results.add(ProcessResult(outputName, true, "저장: $savedDir$note"))
             } else {
-                val log = session.allLogsAsString ?: "알 수 없는 오류"
-                val lastLine = log.lines().lastOrNull { it.isNotBlank() } ?: log.take(200)
-                results.add(ProcessResult(outputName, false, lastLine))
+                results.add(ProcessResult(outputName, false, "저장 실패"))
             }
         } catch (e: Exception) {
-            results.add(ProcessResult(outputName, false, "FFmpeg 오류: ${e.message}"))
+            results.add(ProcessResult(outputName, false, "변환 오류: ${e.message}"))
         } finally {
-            inputFile.delete()
             outputFile.delete()
         }
     }
 
-    // 캐시 정리
-    cacheDir.deleteRecursively()
     outputDir.deleteRecursively()
 
     withContext(Dispatchers.Main) {
@@ -582,6 +563,80 @@ suspend fun processVideos(
     }
 
     results
+}
+
+/**
+ * CRF 값을 하드웨어 인코더용 비트레이트로 환산한다.
+ * CRF 18 ≈ 픽셀당 0.12비트, CRF가 6 오를 때마다 절반.
+ */
+fun estimateBitrate(context: Context, uri: Uri, crf: Int): Int {
+    var width = 1920
+    var height = 1080
+    var fps = 30f
+    val r = MediaMetadataRetriever()
+    try {
+        r.setDataSource(context, uri)
+        r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()?.let { width = it }
+        r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()?.let { height = it }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val frames = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)?.toFloatOrNull()
+            val durMs = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toFloatOrNull()
+            if (frames != null && durMs != null && durMs > 0) {
+                fps = (frames / (durMs / 1000f)).coerceIn(10f, 120f)
+            }
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+    } finally {
+        try { r.release() } catch (_: Exception) {}
+    }
+    val bpp = 0.12 * Math.pow(2.0, -(crf - 18) / 6.0)
+    val bitrate = width.toDouble() * height * fps * bpp
+    return bitrate.coerceIn(500_000.0, 100_000_000.0).toInt()
+}
+
+/** Media3 Transformer로 HEVC(H.265) 변환. 메인 스레드에서 실행해야 한다. */
+suspend fun transcodeHevc(
+    context: Context, uri: Uri, startMs: Long, bitrate: Int, output: File,
+) = withContext(Dispatchers.Main) {
+    suspendCancellableCoroutine<Unit> { cont ->
+        val mediaItem = MediaItem.Builder()
+            .setUri(uri)
+            .setClippingConfiguration(
+                MediaItem.ClippingConfiguration.Builder()
+                    .setStartPositionMs(startMs.coerceAtLeast(0))
+                    .build()
+            )
+            .build()
+
+        val encoderFactory = DefaultEncoderFactory.Builder(context)
+            .setRequestedVideoEncoderSettings(
+                VideoEncoderSettings.Builder().setBitrate(bitrate).build()
+            )
+            .setEnableFallback(true)
+            .build()
+
+        val transformer = Transformer.Builder(context)
+            .setVideoMimeType(MimeTypes.VIDEO_H265)
+            .setEncoderFactory(encoderFactory)
+            .addListener(object : Transformer.Listener {
+                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                    if (cont.isActive) cont.resume(Unit)
+                }
+
+                override fun onError(
+                    composition: Composition,
+                    exportResult: ExportResult,
+                    exportException: ExportException,
+                ) {
+                    if (cont.isActive) cont.resumeWithException(exportException)
+                }
+            })
+            .build()
+
+        cont.invokeOnCancellation { transformer.cancel() }
+        transformer.start(EditedMediaItem.Builder(mediaItem).build(), output.absolutePath)
+    }
 }
 
 // ── MediaStore 저장 ─────────────────────────────────────────
