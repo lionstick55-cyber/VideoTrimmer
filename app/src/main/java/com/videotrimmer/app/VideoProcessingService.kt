@@ -39,6 +39,7 @@ object ProcessingState {
         val speed: Float,
         val title: String,
         val startNumber: Int = 1,
+        val names: List<String>? = null,
     )
 
     @Volatile
@@ -92,6 +93,7 @@ class VideoProcessingService : Service() {
                     speed = job.speed,
                     title = job.title,
                     startNumber = job.startNumber,
+                    names = job.names,
                     onProgress = { p, s ->
                         ProcessingState.progress = p
                         ProcessingState.statusText = s

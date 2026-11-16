@@ -37,6 +37,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -137,6 +138,17 @@ fun VideoTrimmerScreen() {
     var titlePrefix by remember { mutableStateOf("제목") }
     var startNumberText by remember { mutableStateOf("1") }
     val startNumber = startNumberText.toIntOrNull()?.coerceAtLeast(0) ?: 1
+    var perFileTitles by remember { mutableStateOf(false) }
+    val customTitles = remember { mutableStateMapOf<Uri, String>() }
+
+    // 파일 하나의 출력 이름 (확장자 제외)
+    fun baseNameFor(i: Int, vf: VideoFile): String =
+        if (perFileTitles) {
+            safeFileName(customTitles[vf.uri]?.takeIf { it.isNotBlank() }
+                ?: vf.name.substringBeforeLast('.'))
+        } else {
+            "${safeFileName(titlePrefix.ifBlank { "제목" })}_${i + startNumber}"
+        }
     var renameOnly by remember { mutableStateOf(false) }
     var pendingRename by remember { mutableStateOf<List<RenameItem>?>(null) }
     var trashedDone by remember { mutableStateOf(false) }
@@ -169,10 +181,9 @@ fun VideoTrimmerScreen() {
     }
 
     fun startRename() {
-        val t = titlePrefix.ifBlank { "제목" }
         val plan = files.mapIndexed { i, vf ->
             val ext = vf.name.substringAfterLast('.', "mp4")
-            RenameItem(vf, resolveMediaUri(context, vf.uri), "${t}_${i + startNumber}.$ext")
+            RenameItem(vf, resolveMediaUri(context, vf.uri), "${baseNameFor(i, vf)}.$ext")
         }
         trashedDone = false
         val media = plan.mapNotNull { it.mediaUri }
@@ -489,6 +500,47 @@ fun VideoTrimmerScreen() {
                     Spacer(Modifier.height(10.dp))
                     }
 
+                    // 제목 방식: 일괄 / 파일마다
+                    Text("🏷 제목 방식", color = TextPrimary, fontSize = 14.sp)
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        listOf(false to "일괄 (제목_번호)", true to "파일마다 따로").forEach { (mode, label) ->
+                            val selected = perFileTitles == mode
+                            FilledTonalButton(
+                                onClick = { perFileTitles = mode },
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 4.dp),
+                                colors = ButtonDefaults.filledTonalButtonColors(
+                                    containerColor = if (selected) Accent else InputBg,
+                                    contentColor = Color.White,
+                                ),
+                            ) {
+                                Text(label, fontSize = 13.sp,
+                                     fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+
+                    if (perFileTitles) {
+                        if (files.isEmpty()) {
+                            Text("먼저 영상을 선택해 주세요", color = TextDim, fontSize = 12.sp)
+                        }
+                        files.forEachIndexed { i, vf ->
+                            OutlinedTextField(
+                                value = customTitles[vf.uri] ?: vf.name.substringBeforeLast('.'),
+                                onValueChange = { customTitles[vf.uri] = it },
+                                label = { Text("${i + 1}. ${vf.name}", maxLines = 1,
+                                               overflow = TextOverflow.Ellipsis) },
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                                singleLine = true,
+                                colors = inputColors(),
+                            )
+                        }
+                    } else
                     // Title prefix + start number
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedTextField(
@@ -526,10 +578,9 @@ fun VideoTrimmerScreen() {
                         Text("👁 출력 미리보기", color = TextDim, fontSize = 12.sp,
                              fontWeight = FontWeight.Bold)
                         Spacer(Modifier.height(6.dp))
-                        val t = titlePrefix.ifBlank { "제목" }
                         files.take(4).forEachIndexed { i, vf ->
                             val ext = if (renameOnly) vf.name.substringAfterLast('.', "mp4") else "mp4"
-                            Text("${vf.name}  →  ${t}_${i + startNumber}.$ext",
+                            Text("${vf.name}  →  ${baseNameFor(i, vf)}.$ext",
                                  color = Color(0xFF66ddaa), fontSize = 12.sp)
                         }
                         if (files.size > 4) {
@@ -563,6 +614,7 @@ fun VideoTrimmerScreen() {
                                 speed = speed,
                                 title = titlePrefix.ifBlank { "제목" },
                                 startNumber = startNumber,
+                                names = files.mapIndexed { i, vf -> baseNameFor(i, vf) },
                             )
                         )
                         Toast.makeText(context,
@@ -758,6 +810,7 @@ suspend fun processVideos(
     speed: Float,
     title: String,
     startNumber: Int = 1,
+    names: List<String>? = null,
     onProgress: (Float, String) -> Unit,
     onResult: (ProcessResult) -> Unit = {},
 ): List<ProcessResult> = withContext(Dispatchers.IO) {
@@ -766,7 +819,7 @@ suspend fun processVideos(
 
     files.forEachIndexed { index, vf ->
         val num = index + 1
-        val outputName = "${title}_${index + startNumber}.mp4"
+        val outputName = (names?.getOrNull(index) ?: "${title}_${index + startNumber}") + ".mp4"
 
         withContext(Dispatchers.Main) {
             onProgress(index.toFloat() / files.size, "[$num/${files.size}] ${vf.name} · 준비 중")
@@ -1092,6 +1145,10 @@ fun saveToMediaStore(
 }
 
 // ── Utilities ───────────────────────────────────────────────
+
+/** 파일 이름에 쓸 수 없는 문자 제거 */
+fun safeFileName(name: String): String =
+    name.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().ifBlank { "제목" }
 
 fun getFileInfo(context: Context, uri: Uri): Pair<String, Long> {
     var name = "video"
