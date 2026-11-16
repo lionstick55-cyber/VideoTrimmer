@@ -587,10 +587,30 @@ suspend fun processVideos(
             if (endMs != null && endMs <= startMs) {
                 throw IllegalArgumentException("영상이 자를 길이보다 짧아요")
             }
-            transcodeHevc(context, vf.uri, startMs, endMs, speed, info.bitrate, outputFile) { f ->
-                val pct = (f * 100).toInt()
-                onProgress((index + f) / files.size,
-                    "[$num/${files.size}] ${vf.name} · 변환 중 $pct%")
+            // 멈추면 잠깐 쉬었다가 한 번 더 시도
+            var attempt = 1
+            while (true) {
+                try {
+                    transcodeHevc(
+                        context, vf.uri, startMs, endMs, speed, info.bitrate, outputFile,
+                        onFileProgress = { f ->
+                            val pct = (f * 100).toInt()
+                            onProgress((index + f) / files.size,
+                                "[$num/${files.size}] ${vf.name} · 변환 중 $pct%")
+                        },
+                        onWaiting = { w ->
+                            val retry = if (attempt > 1) " (재시도)" else ""
+                            onProgress(index.toFloat() / files.size,
+                                "[$num/${files.size}] ${vf.name} · $w$retry")
+                        },
+                    )
+                    break
+                } catch (e: StallException) {
+                    outputFile.delete()
+                    if (attempt >= 2) throw IllegalStateException("두 번 시도했지만 멈춤 (${e.message})")
+                    attempt++
+                    delay(3000)
+                }
             }
 
             withContext(Dispatchers.Main) {
@@ -655,13 +675,17 @@ fun sourceInfo(context: Context, uri: Uri): SourceInfo {
     return SourceInfo(b.coerceIn(1_000_000L, 150_000_000L).toInt(), durationMs)
 }
 
-private const val STALL_TIMEOUT_MS = 120_000L
+private const val START_TIMEOUT_MS = 30_000L   // 시작 자체가 안 될 때
+private const val STALL_TIMEOUT_MS = 120_000L   // 중간에 멈췄을 때
+
+class StallException(message: String) : Exception(message)
 
 /** Media3 Transformer로 HEVC(H.265) 변환. 메인 스레드에서 실행해야 한다. */
 suspend fun transcodeHevc(
     context: Context, uri: Uri, startMs: Long, endMs: Long?, speed: Float,
     bitrate: Int, output: File,
     onFileProgress: (Float) -> Unit = {},
+    onWaiting: (String) -> Unit = {},
 ) = withContext(Dispatchers.Main) {
     suspendCancellableCoroutine<Unit> { cont ->
         val mediaItem = MediaItem.Builder()
@@ -703,24 +727,36 @@ suspend fun transcodeHevc(
         val handler = Handler(Looper.getMainLooper())
         val holder = ProgressHolder()
         var lastProgress = -1
-        var lastChange = System.currentTimeMillis()
+        val startedAt = System.currentTimeMillis()
+        var lastChange = startedAt
         val poll = object : Runnable {
             override fun run() {
                 if (!cont.isActive) return
-                if (transformer.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) {
+                val now = System.currentTimeMillis()
+                val state = transformer.getProgress(holder)
+                if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
                     onFileProgress(holder.progress / 100f)
                     if (holder.progress != lastProgress) {
                         lastProgress = holder.progress
-                        lastChange = System.currentTimeMillis()
+                        lastChange = now
                     }
+                } else if (lastProgress < 0) {
+                    val stateName = when (state) {
+                        Transformer.PROGRESS_STATE_NOT_STARTED -> "시작 전"
+                        Transformer.PROGRESS_STATE_WAITING_FOR_AVAILABILITY -> "인코더 대기"
+                        Transformer.PROGRESS_STATE_UNAVAILABLE -> "진행률 없음"
+                        else -> "상태 $state"
+                    }
+                    onWaiting("준비 중 · $stateName · ${(now - startedAt) / 1000}초")
                 }
-                // 2분 동안 진행이 전혀 없으면 멈춘 것으로 보고 이 파일은 건너뜀
-                if (System.currentTimeMillis() - lastChange > STALL_TIMEOUT_MS) {
+
+                val stalled = if (lastProgress <= 0) now - startedAt > START_TIMEOUT_MS
+                              else now - lastChange > STALL_TIMEOUT_MS
+                if (stalled) {
+                    handler.removeCallbacks(this)
                     transformer.cancel()
                     if (cont.isActive) cont.resumeWithException(
-                        IllegalStateException(
-                            "2분 동안 진행이 없어 건너뜀 (진행률 ${maxOf(lastProgress, 0)}%에서 멈춤)"
-                        )
+                        StallException("진행률 ${maxOf(lastProgress, 0)}%에서 멈춤")
                     )
                     return
                 }
